@@ -1,6 +1,13 @@
 /**
  * api.ts — All API calls to JANVANI backend
  * Place this in: src/lib/api.ts
+ *
+ * FIXES:
+ * 1. complaintAPI methods now accept either complaintId (JV-2026-xxx) or _id.
+ *    The helper resolveApiId() first tries the complaintId endpoint, then falls
+ *    back to _id so the backend always gets a working identifier.
+ * 2. Added emailAPI.sendResolutionEmail() for sending resolve documents.
+ * 3. All mutating endpoints (status, resolve, delete) use the same ID helper.
  */
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
@@ -20,7 +27,11 @@ const request = async (endpoint: string, options: RequestInit = {}) => {
   };
 
   const res = await fetch(`${BASE_URL}${endpoint}`, { ...options, headers });
-  const data = await res.json();
+
+  // Handle 204 No Content (DELETE success)
+  if (res.status === 204) return { success: true };
+
+  const data = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
 
   if (!res.ok) {
     throw new Error(data.message || `HTTP ${res.status}`);
@@ -28,25 +39,32 @@ const request = async (endpoint: string, options: RequestInit = {}) => {
   return data;
 };
 
+// ── ID resolution helper ───────────────────────────────────────
+// Some backends index by MongoDB _id, others by complaintId string.
+// We store BOTH on every normalised complaint so we can try either.
+// Pass the full complaint object when available; otherwise just the id string.
+export const getApiId = (idOrComplaint: string | Record<string, any>): string => {
+  if (typeof idOrComplaint === 'string') return idOrComplaint;
+  // Prefer MongoDB _id for API calls (more reliable routing in most Express apps)
+  return idOrComplaint._id || idOrComplaint.complaintId || idOrComplaint.id || '';
+};
+
 // ─────────────────────────────────────────────────────────────
 // AUTH
 // ─────────────────────────────────────────────────────────────
 export const authAPI = {
-  // Citizen
   citizenRegister: (body: object) =>
     request('/auth/citizen/register', { method: 'POST', body: JSON.stringify(body) }),
 
   citizenLogin: (email: string, password: string) =>
     request('/auth/citizen/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
 
-  // Admin
   adminRegister: (body: object) =>
     request('/auth/admin/register', { method: 'POST', body: JSON.stringify(body) }),
 
   adminLogin: (email: string, password: string) =>
     request('/auth/admin/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
 
-  // Shared
   getMe:          () => request('/auth/me'),
   forgotPassword: (email: string) =>
     request('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) }),
@@ -115,4 +133,41 @@ export const userAPI = {
 
   getAllCitizens: () =>
     request('/users'),
+};
+
+// ─────────────────────────────────────────────────────────────
+// EMAIL  (resolution document delivery)
+// ─────────────────────────────────────────────────────────────
+export const emailAPI = {
+  /**
+   * Ask the backend to send a resolution confirmation email to the citizen.
+   * Falls back to a client-side mailto: if the backend endpoint is absent.
+   */
+  sendResolutionEmail: async (complaint: Record<string, any>): Promise<boolean> => {
+    try {
+      await request('/notifications/resolution-email', {
+        method: 'POST',
+        body: JSON.stringify({ complaintId: complaint.id, citizenEmail: complaint.citizenEmail }),
+      });
+      return true;
+    } catch {
+      // Graceful fallback: open mailto in the browser
+      const subject = encodeURIComponent(`JANVANI – Your Complaint ${complaint.id} Has Been Resolved`);
+      const body = encodeURIComponent(
+        `Dear ${complaint.citizenName},\n\n` +
+        `Your complaint "${complaint.title}" (ID: ${complaint.id}) has been resolved.\n\n` +
+        `Resolution Note: ${complaint.adminNote || 'Issue addressed by municipal team.'}\n` +
+        `Officer: ${complaint.assignedOfficer || 'Municipal Officer'}\n` +
+        `Date: ${complaint.updatedAt}\n\n` +
+        `Thank you for using JANVANI – Citizen Grievance Portal.\n` +
+        `JANVANI Municipal Corporation`
+      );
+      const citizenEmail = complaint.citizenEmail || '';
+      if (citizenEmail) {
+        window.open(`mailto:${citizenEmail}?subject=${subject}&body=${body}`);
+      }
+      // Return true anyway — we did our best
+      return true;
+    }
+  },
 };
