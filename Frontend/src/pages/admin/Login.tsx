@@ -26,16 +26,18 @@ export default function AdminLogin() {
   const [rJoined, setRJoined] = useState('');
   const [rPw, setRPw] = useState('');
 
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    const u = login(email, password);
+const handleLogin = async (e: React.FormEvent) => {
+  e.preventDefault();
+  try {
+    const u = await login(email, password, 'admin');
     if (u && u.role === 'admin') {
       toast({ title: '✅ Welcome, Officer!', description: `Logged in as ${u.name}` });
       navigate('/admin/dashboard');
-    } else {
-      toast({ title: '❌ Login failed', description: 'Invalid credentials or not an admin account', variant: 'destructive' });
     }
-  };
+  } catch (err: any) {
+    toast({ title: '❌ Login failed', description: err.message || 'Invalid credentials', variant: 'destructive' });
+  }
+};
 
   const handleRegister = (e: React.FormEvent) => {
     e.preventDefault();
