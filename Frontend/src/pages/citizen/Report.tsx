@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/hooks/use-toast';
-import { Camera, MapPin, Mic, Sparkles, CheckCircle } from 'lucide-react';
+import { Camera, MapPin, Mic, Sparkles, CheckCircle, Loader2 } from 'lucide-react';
 import { CATEGORIES, type Category, type Priority } from '@/types';
 
 export default function CitizenReport() {
@@ -19,6 +19,7 @@ export default function CitizenReport() {
   const [photo, setPhoto] = useState('');
   const [location, setLocation] = useState('');
   const [gps, setGps] = useState({ lat: 20.0059, lng: 73.7897 });
+  const [locating, setLocating] = useState(false);
   const [category, setCategory] = useState<Category>('Road');
   const [analyzing, setAnalyzing] = useState(false);
   const [title, setTitle] = useState('');
@@ -26,7 +27,9 @@ export default function CitizenReport() {
   const [priority, setPriority] = useState<Priority>('Medium');
   const [estimated, setEstimated] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [listening, setListening] = useState(false);
 
+  /* -------------------- PHOTO UPLOAD -------------------- */
   const handlePhoto = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -36,11 +39,91 @@ export default function CitizenReport() {
     }
   };
 
+  /* -------------------- LIVE GPS LOCATION -------------------- */
   const detectLocation = () => {
-    setLocation(`Ward ${currentUser?.ward || 7}, Nashik — ${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)}`);
-    toast({ title: '📍 Location detected' });
+    if (!navigator.geolocation) {
+      toast({ title: '❌ Geolocation not supported', description: 'Your browser does not support location detection.' });
+      return;
+    }
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      async (position) => {
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+        setGps({ lat, lng });
+        const ward = currentUser?.ward || 1;
+
+        // Reverse geocode using Nominatim (OpenStreetMap) — free, no API key
+        try {
+          const res = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`,
+            { headers: { 'Accept-Language': 'en' } }
+          );
+          const data = await res.json();
+          const addr = data.address || {};
+          // Build a human-readable area name from available fields
+          const area =
+            addr.suburb ||
+            addr.neighbourhood ||
+            addr.village ||
+            addr.town ||
+            addr.city_district ||
+            addr.county ||
+            addr.city ||
+            '';
+          const city = addr.city || addr.town || addr.county || 'Nashik';
+          const areaLabel = area ? `${area}, ${city}` : city;
+          setLocation(`Ward ${ward}, ${areaLabel} — ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+        } catch {
+          // Fallback if fetch fails
+          setLocation(`Ward ${ward}, Nashik — ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+        }
+
+        setLocating(false);
+        toast({ title: '📍 Live location detected' });
+      },
+      (error) => {
+        setLocating(false);
+        const ward = currentUser?.ward || 1;
+        setLocation(`Ward ${ward}, Nashik — ${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)}`);
+        toast({ title: '⚠️ Using default location', description: error.message });
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
   };
 
+  /* -------------------- VOICE TYPING -------------------- */
+  const startVoiceTyping = () => {
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      toast({ title: '❌ Speech Recognition not supported' });
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-IN';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.start();
+    setListening(true);
+
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setDescription((prev) => prev + ' ' + transcript);
+    };
+
+    recognition.onend = () => setListening(false);
+
+    recognition.onerror = () => {
+      setListening(false);
+      toast({ title: '❌ Voice recognition error' });
+    };
+  };
+
+  /* -------------------- STEP 2 AI MOCK -------------------- */
   const goStep2 = () => {
     setStep(2);
     setAnalyzing(true);
@@ -54,31 +137,51 @@ export default function CitizenReport() {
         Other: 'Civic issue reported requiring municipal attention. Detailed assessment needed for appropriate departmental action.',
       };
       setDescription(descs[category]);
-      setTitle(`${category} Issue — Ward ${currentUser?.ward || 7}`);
+      setTitle(`${category} Issue — Ward ${currentUser?.ward || 1}`);
       setPriority(category === 'Electricity' ? 'High' : 'Medium');
-      const d = new Date(); d.setDate(d.getDate() + 14);
+      const d = new Date();
+      d.setDate(d.getDate() + 14);
       setEstimated(d.toISOString().split('T')[0]);
     }, 2000);
   };
 
+  /* -------------------- SUBMIT -------------------- */
   const handleSubmit = () => {
     if (!currentUser) return;
     setSubmitting(true);
     setTimeout(() => {
       const id = `JV-2026-${String(Date.now()).slice(-3)}`;
       addComplaint({
-        id, citizenId: currentUser.id, citizenName: currentUser.name, citizenPhone: currentUser.phone,
-        title, description, category, priority, status: 'Submitted',
-        ward: currentUser.ward || 1, location: location || 'Nashik', gpsCoords: gps,
-        photo, resolvePhoto: '', adminNote: '', assignedOfficer: '', department: category === 'Road' ? 'Roads & Infrastructure' : category,
-        mergedCount: 0, supportCount: 0, createdAt: new Date().toISOString().split('T')[0], updatedAt: new Date().toISOString().split('T')[0],
+        id,
+        citizenId: currentUser.id,
+        citizenName: currentUser.name,
+        citizenPhone: currentUser.phone,
+        title,
+        description,
+        category,
+        priority,
+        status: 'Submitted',
+        ward: currentUser.ward || 1,
+        location: location || 'Nashik',
+        gpsCoords: gps,
+        photo,
+        resolvePhoto: '',
+        adminNote: '',
+        assignedOfficer: '',
+        department: category === 'Road' ? 'Roads & Infrastructure' : category,
+        mergedCount: 0,
+        supportCount: 0,
+        createdAt: new Date().toISOString().split('T')[0],
+        updatedAt: new Date().toISOString().split('T')[0],
         timeline: [
           { label: 'Submitted', done: true, date: new Date().toISOString().split('T')[0] },
           { label: 'Under Review', done: false, date: null },
           { label: 'In Progress', done: false, date: null },
           { label: 'Resolved', done: false, date: null },
         ],
-        estimatedResolution: estimated, feedback: null, isSOS: false,
+        estimatedResolution: estimated,
+        feedback: null,
+        isSOS: false,
       });
       toast({ title: '🎉 Complaint submitted!', description: `ID: ${id} • +50 points` });
       setSubmitting(false);
@@ -95,50 +198,83 @@ export default function CitizenReport() {
         <div className="flex items-center gap-2 mb-8">
           {['Capture', 'AI Description', 'Review'].map((s, i) => (
             <div key={i} className="flex-1 flex items-center gap-2">
-              <div className={`h-8 w-8 rounded-full flex items-center justify-center text-sm font-bold ${step > i + 1 ? 'bg-success text-success-foreground' : step === i + 1 ? 'bg-accent text-accent-foreground' : 'bg-muted text-muted-foreground'}`}>{step > i + 1 ? '✓' : i + 1}</div>
+              <div
+                className={`h-8 w-8 rounded-full flex items-center justify-center text-sm font-bold ${
+                  step > i + 1
+                    ? 'bg-success text-success-foreground'
+                    : step === i + 1
+                    ? 'bg-accent text-accent-foreground'
+                    : 'bg-muted text-muted-foreground'
+                }`}
+              >
+                {step > i + 1 ? '✓' : i + 1}
+              </div>
               <span className={`text-xs hidden sm:inline ${step === i + 1 ? 'font-semibold' : 'text-muted-foreground'}`}>{s}</span>
               {i < 2 && <div className={`flex-1 h-0.5 ${step > i + 1 ? 'bg-success' : 'bg-muted'}`} />}
             </div>
           ))}
         </div>
 
+        {/* ── STEP 1: Capture ── */}
         {step === 1 && (
           <div className="space-y-5 animate-fade-in">
-            {/* Photo upload */}
+
+            {/* Photo */}
             <div>
               <Label>Photo Evidence</Label>
               <label className="mt-2 border-2 border-dashed border-border rounded-lg p-8 flex flex-col items-center cursor-pointer hover:border-accent transition-colors">
-                {photo ? <img src={photo} className="max-h-48 rounded-lg object-cover" alt="Upload" /> : (
-                  <><Camera className="h-10 w-10 text-muted-foreground mb-2" /><span className="text-sm text-muted-foreground">Click or drag to upload</span></>
+                {photo ? (
+                  <img src={photo} className="max-h-48 rounded-lg object-cover" alt="Upload" />
+                ) : (
+                  <>
+                    <Camera className="h-10 w-10 text-muted-foreground mb-2" />
+                    <span className="text-sm text-muted-foreground">Click or drag to upload</span>
+                  </>
                 )}
                 <input type="file" accept="image/*" className="hidden" onChange={handlePhoto} />
               </label>
             </div>
 
-            {/* Location */}
-            <div className="flex gap-3">
-              <Button type="button" variant="outline" onClick={detectLocation}><MapPin className="h-4 w-4" /> Detect Location</Button>
-              <Button type="button" variant="outline" onClick={() => toast({ title: '🎙️ Voice note recorded (demo)' })}><Mic className="h-4 w-4" /> Voice Note</Button>
+            {/* Live Location */}
+            <div className="space-y-2">
+              <Button type="button" variant="outline" onClick={detectLocation} disabled={locating}>
+                {locating ? <Loader2 className="h-4 w-4 animate-spin" /> : <MapPin className="h-4 w-4" />}
+                {locating ? 'Detecting…' : 'Detect Location'}
+              </Button>
+              {location && (
+                <p className="text-sm text-success bg-success/10 rounded-lg px-3 py-2">
+                  📍 {location}
+                </p>
+              )}
             </div>
-            {location && <p className="text-sm text-success bg-success/10 rounded-lg px-3 py-2">📍 {location}</p>}
 
             {/* Category */}
             <div>
               <Label>Category</Label>
               <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 mt-2">
-                {CATEGORIES.map(c => (
-                  <button key={c} onClick={() => setCategory(c)}
-                    className={`p-3 rounded-lg border text-sm font-medium transition-all ${category === c ? 'border-accent bg-accent/10 text-accent' : 'border-border hover:border-accent/50'}`}>
+                {CATEGORIES.map((c) => (
+                  <button
+                    key={c}
+                    onClick={() => setCategory(c)}
+                    className={`p-3 rounded-lg border text-sm font-medium transition-all ${
+                      category === c
+                        ? 'border-accent bg-accent/10 text-accent'
+                        : 'border-border hover:border-accent/50'
+                    }`}
+                  >
                     {c === 'Road' ? '🛣️' : c === 'Water' ? '💧' : c === 'Sanitation' ? '🗑️' : c === 'Electricity' ? '⚡' : '📋'} {c}
                   </button>
                 ))}
               </div>
             </div>
 
-            <Button variant="hero" className="w-full" onClick={goStep2}>Continue to AI Analysis →</Button>
+            <Button variant="hero" className="w-full" onClick={goStep2}>
+              Continue to AI Analysis →
+            </Button>
           </div>
         )}
 
+        {/* ── STEP 2: AI Description ── */}
         {step === 2 && (
           <div className="space-y-5 animate-fade-in">
             {analyzing ? (
@@ -146,21 +282,70 @@ export default function CitizenReport() {
                 <div className="animate-pulse-dot inline-block h-4 w-4 rounded-full bg-accent mb-4" />
                 <p className="text-lg font-heading font-semibold">🤖 AI Analyzing...</p>
                 <p className="text-sm text-muted-foreground mt-2">Processing image and generating description</p>
-                <div className="mt-4 space-y-2 max-w-sm mx-auto">{[1, 2, 3].map(i => <div key={i} className="h-3 bg-muted rounded animate-pulse" />)}</div>
+                <div className="mt-4 space-y-2 max-w-sm mx-auto">
+                  {[1, 2, 3].map((i) => (
+                    <div key={i} className="h-3 bg-muted rounded animate-pulse" />
+                  ))}
+                </div>
               </div>
             ) : (
               <>
                 <div className="bg-accent/5 border border-accent/20 rounded-lg p-3 flex items-center gap-2 text-sm">
-                  <Sparkles className="h-4 w-4 text-accent" /><span className="font-medium">✨ AI Generated</span><span className="text-muted-foreground">— you can edit below</span>
+                  <Sparkles className="h-4 w-4 text-accent" />
+                  <span className="font-medium">✨ AI Generated</span>
+                  <span className="text-muted-foreground">— you can edit below</span>
                 </div>
-                <div><Label>Title</Label><Input value={title} onChange={e => setTitle(e.target.value)} /></div>
-                <div><Label>Description</Label><Textarea value={description} onChange={e => setDescription(e.target.value)} rows={4} /></div>
+
+                <div>
+                  <Label>Title</Label>
+                  <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+                </div>
+
+                {/* Description + inline Voice Typing button */}
+                <div>
+                  <Label>Description</Label>
+                  <div className="flex gap-2 mt-1">
+                    <Textarea
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      rows={4}
+                      className="flex-1"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={startVoiceTyping}
+                      className="self-start px-3"
+                      title={listening ? 'Listening…' : 'Voice type into description'}
+                    >
+                      <Mic className={`h-4 w-4 ${listening ? 'text-destructive animate-pulse' : ''}`} />
+                    </Button>
+                  </div>
+                  {listening && (
+                    <p className="text-xs text-destructive mt-1 flex items-center gap-1">
+                      <span className="inline-block h-2 w-2 rounded-full bg-destructive animate-pulse" />
+                      Listening…
+                    </p>
+                  )}
+                </div>
+
                 <div className="grid grid-cols-2 gap-4">
-                  <div><Label>Priority</Label><select value={priority} onChange={e => setPriority(e.target.value as Priority)} className="w-full h-10 rounded-md border border-input bg-background px-3 text-sm">
-                    {['Low', 'Medium', 'High', 'Critical'].map(p => <option key={p}>{p}</option>)}
-                  </select></div>
-                  <div><Label>Est. Resolution</Label><Input type="date" value={estimated} onChange={e => setEstimated(e.target.value)} /></div>
+                  <div>
+                    <Label>Priority</Label>
+                    <select
+                      value={priority}
+                      onChange={(e) => setPriority(e.target.value as Priority)}
+                      className="w-full h-10 rounded-md border border-input bg-background px-3 text-sm"
+                    >
+                      {['Low', 'Medium', 'High', 'Critical'].map((p) => <option key={p}>{p}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <Label>Est. Resolution</Label>
+                    <Input type="date" value={estimated} onChange={(e) => setEstimated(e.target.value)} />
+                  </div>
                 </div>
+
                 <div className="flex gap-3">
                   <Button variant="outline" onClick={() => setStep(1)}>← Back</Button>
                   <Button variant="hero" className="flex-1" onClick={() => setStep(3)}>Review →</Button>
@@ -170,6 +355,7 @@ export default function CitizenReport() {
           </div>
         )}
 
+        {/* ── STEP 3: Review ── */}
         {step === 3 && (
           <div className="space-y-5 animate-fade-in">
             <div className="card-elevated p-6 space-y-3">
@@ -178,18 +364,29 @@ export default function CitizenReport() {
               <p className="text-sm text-muted-foreground">{description}</p>
               <div className="flex flex-wrap gap-2">
                 <span className="badge-pill bg-muted text-muted-foreground">{category}</span>
-                <span className={`badge-pill ${priority === 'High' || priority === 'Critical' ? 'bg-destructive/10 text-destructive' : 'bg-warning/10 text-warning'}`}>{priority}</span>
+                <span
+                  className={`badge-pill ${
+                    priority === 'High' || priority === 'Critical'
+                      ? 'bg-destructive/10 text-destructive'
+                      : 'bg-warning/10 text-warning'
+                  }`}
+                >
+                  {priority}
+                </span>
                 {location && <span className="badge-pill bg-success/10 text-success">📍 {location}</span>}
               </div>
               <p className="text-xs text-muted-foreground">Est. resolution: {estimated}</p>
             </div>
+
             <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" className="rounded" defaultChecked /><span>I confirm all details are correct</span>
+              <input type="checkbox" className="rounded" defaultChecked />
+              <span>I confirm all details are correct</span>
             </label>
+
             <div className="flex gap-3">
               <Button variant="outline" onClick={() => setStep(2)}>← Back</Button>
               <Button variant="hero" className="flex-1" onClick={handleSubmit} disabled={submitting}>
-                {submitting ? <span className="animate-spin">⏳</span> : <CheckCircle className="h-4 w-4" />}
+                {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
                 {submitting ? 'Submitting...' : 'Submit Complaint'}
               </Button>
             </div>
