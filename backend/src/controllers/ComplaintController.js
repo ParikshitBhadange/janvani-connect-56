@@ -2,6 +2,20 @@ import { Complaint } from '../models/Complaint.js';
 import { User } from '../models/User.js';
 
 // ─────────────────────────────────────────────────────────────
+// Helper: add citizenEmail to complaint object for admin views
+// ─────────────────────────────────────────────────────────────
+const withCitizenEmail = async (complaint) => {
+  const obj = complaint.toObject ? complaint.toObject() : { ...complaint };
+  if (!obj.citizenEmail && obj.citizenId) {
+    try {
+      const citizen = await User.findById(obj.citizenId).select('email').lean();
+      if (citizen?.email) obj.citizenEmail = citizen.email;
+    } catch {}
+  }
+  return obj;
+};
+
+// ─────────────────────────────────────────────────────────────
 // POST /api/complaints  — citizen submits a complaint
 // ─────────────────────────────────────────────────────────────
 export const createComplaint = async (req, res) => {
@@ -12,29 +26,35 @@ export const createComplaint = async (req, res) => {
       gpsCoords, photo, estimatedResolution, isSOS, sosType,
     } = req.body;
 
+    if (!title || !description || !category) {
+      return res.status(400).json({ success: false, message: 'Title, description and category are required' });
+    }
+
     const complaint = await Complaint.create({
       citizenId    : citizen._id,
       citizenName  : citizen.name,
       citizenPhone : citizen.phone,
       title, description, category,
       priority     : priority || 'Medium',
-      ward         : ward || citizen.ward,
+      ward         : ward || citizen.ward || 1,
       location     : location || '',
       gpsCoords    : gpsCoords || { lat: 0, lng: 0 },
       photo        : photo || '',
-      estimatedResolution,
+      estimatedResolution: estimatedResolution || '',
       isSOS        : isSOS || false,
       sosType      : sosType || '',
       department   : mapCategoryToDept(category),
     });
 
-    // Award 50 points to citizen
+    // Award +50 points to citizen
     await User.findByIdAndUpdate(citizen._id, {
       $inc: { points: 50, complaintsSubmitted: 1 },
     });
     await updateBadge(citizen._id);
 
-    return res.status(201).json({ success: true, complaint });
+    // Attach citizenEmail to response so admin board has it
+    const complaintObj = await withCitizenEmail(complaint);
+    return res.status(201).json({ success: true, complaint: complaintObj });
   } catch (err) {
     console.error('createComplaint error:', err);
     res.status(500).json({ success: false, message: err.message });
@@ -42,32 +62,45 @@ export const createComplaint = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/complaints  — admin gets all; citizen gets their own
+// GET /api/complaints  — admin sees ALL; citizen sees their own
 // ─────────────────────────────────────────────────────────────
 export const getComplaints = async (req, res) => {
   try {
-    const { category, priority, status, ward, search, page = 1, limit = 50 } = req.query;
+    const { category, priority, status, ward, search, page = 1, limit = 200 } = req.query;
     const filter = {};
 
-    // Citizens only see their own
+    // Citizens only see their own complaints
     if (req.user.role === 'citizen') filter.citizenId = req.user._id;
+    // Admins see ALL complaints from all citizens (no filter on citizenId)
 
     if (category) filter.category = category;
-    if (priority)  filter.priority  = priority;
-    if (status)    filter.status    = status;
-    if (ward)      filter.ward      = parseInt(ward);
-    if (search)    filter.$or = [
+    if (priority) filter.priority = priority;
+    if (status)   filter.status   = status;
+    if (ward)     filter.ward     = parseInt(ward);
+    if (search)   filter.$or      = [
       { title       : { $regex: search, $options: 'i' } },
       { complaintId : { $regex: search, $options: 'i' } },
+      { citizenName : { $regex: search, $options: 'i' } },
     ];
 
     const complaints = await Complaint.find(filter)
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+      .limit(parseInt(limit))
+      .populate('citizenId', 'email');  // populate citizen email
 
     const total = await Complaint.countDocuments(filter);
-    res.json({ success: true, complaints, total });
+
+    // Attach citizenEmail from populated citizenId
+    const enriched = complaints.map(c => {
+      const obj = c.toObject();
+      if (c.citizenId?.email) obj.citizenEmail = c.citizenId.email;
+      // Keep citizenId as string for frontend compatibility
+      if (obj.citizenId?._id) obj.citizenId = obj.citizenId._id;
+      return obj;
+    });
+
+    res.json({ success: true, complaints: enriched, total });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -79,15 +112,20 @@ export const getComplaints = async (req, res) => {
 export const getComplaintById = async (req, res) => {
   try {
     const query = { $or: [{ _id: req.params.id }, { complaintId: req.params.id }] };
-    const complaint = await Complaint.findOne(query);
+    const complaint = await Complaint.findOne(query).populate('citizenId', 'email');
     if (!complaint) return res.status(404).json({ success: false, message: 'Complaint not found' });
 
     // Citizen can only view their own
-    if (req.user.role === 'citizen' && complaint.citizenId.toString() !== req.user._id.toString()) {
+    const citizenObjId = complaint.citizenId?._id || complaint.citizenId;
+    if (req.user.role === 'citizen' && citizenObjId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    res.json({ success: true, complaint });
+    const obj = complaint.toObject();
+    if (complaint.citizenId?.email) obj.citizenEmail = complaint.citizenId.email;
+    if (obj.citizenId?._id) obj.citizenId = obj.citizenId._id;
+
+    res.json({ success: true, complaint: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -95,29 +133,33 @@ export const getComplaintById = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // PATCH /api/complaints/:id/status  — admin updates status
+// When admin changes status → citizen sees it in real time via refreshComplaints
 // ─────────────────────────────────────────────────────────────
 export const updateStatus = async (req, res) => {
   try {
     const { status, adminNote, assignedOfficer } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ success: false, message: 'Status is required' });
+    }
+
     const complaint = await Complaint.findOne({
       $or: [{ _id: req.params.id }, { complaintId: req.params.id }],
     });
-
     if (!complaint) return res.status(404).json({ success: false, message: 'Complaint not found' });
 
     const today = new Date().toISOString().split('T')[0];
 
-    // Update timeline based on new status
+    // Update timeline steps up to new status
     const statusToStep = {
       'Under Review' : 1,
       'In Progress'  : 2,
       'Resolved'     : 3,
     };
-
     const stepIdx = statusToStep[status];
     if (stepIdx !== undefined) {
       for (let i = 1; i <= stepIdx; i++) {
-        if (!complaint.timeline[i].done) {
+        if (complaint.timeline[i] && !complaint.timeline[i].done) {
           complaint.timeline[i].done = true;
           complaint.timeline[i].date = today;
         }
@@ -129,14 +171,16 @@ export const updateStatus = async (req, res) => {
     if (assignedOfficer) complaint.assignedOfficer = assignedOfficer;
 
     await complaint.save();
-    res.json({ success: true, complaint });
+
+    const obj = await withCitizenEmail(complaint);
+    res.json({ success: true, complaint: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
 // ─────────────────────────────────────────────────────────────
-// PATCH /api/complaints/:id/resolve  — admin resolves with photo
+// PATCH /api/complaints/:id/resolve  — admin resolves with proof
 // ─────────────────────────────────────────────────────────────
 export const resolveComplaint = async (req, res) => {
   try {
@@ -144,39 +188,38 @@ export const resolveComplaint = async (req, res) => {
     const complaint = await Complaint.findOne({
       $or: [{ _id: req.params.id }, { complaintId: req.params.id }],
     });
-
     if (!complaint) return res.status(404).json({ success: false, message: 'Complaint not found' });
 
     const today = new Date().toISOString().split('T')[0];
 
     // Mark all timeline steps done
-    complaint.timeline = complaint.timeline.map((step, i) => ({
+    complaint.timeline = complaint.timeline.map(step => ({
       ...step.toObject(),
-      done : true,
-      date : step.date || today,
+      done: true,
+      date: step.date || today,
     }));
 
-    complaint.status         = 'Resolved';
-    complaint.resolvePhoto   = resolvePhoto || '';
-    complaint.adminNote      = adminNote || complaint.adminNote;
+    complaint.status          = 'Resolved';
+    complaint.resolvePhoto    = resolvePhoto || '';
+    complaint.adminNote       = adminNote || complaint.adminNote;
     complaint.assignedOfficer = assignedOfficer || complaint.assignedOfficer;
-
     await complaint.save();
 
-    // Award 100 points to citizen
+    // Award +100 pts to citizen
     await User.findByIdAndUpdate(complaint.citizenId, {
       $inc: { points: 100, complaintsResolved: 1 },
     });
     await updateBadge(complaint.citizenId);
 
-    res.json({ success: true, complaint });
+    const obj = await withCitizenEmail(complaint);
+    res.json({ success: true, complaint: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/complaints/:id/support  — citizen supports an issue
+// POST /api/complaints/:id/support
 // ─────────────────────────────────────────────────────────────
 export const supportComplaint = async (req, res) => {
   try {
@@ -186,8 +229,6 @@ export const supportComplaint = async (req, res) => {
     if (!complaint) return res.status(404).json({ success: false, message: 'Complaint not found' });
 
     const userId = req.user._id;
-
-    // Prevent double support
     if (complaint.supportedBy.includes(userId)) {
       return res.status(400).json({ success: false, message: 'Already supported' });
     }
@@ -196,7 +237,7 @@ export const supportComplaint = async (req, res) => {
     complaint.supportCount = complaint.supportedBy.length;
     await complaint.save();
 
-    // +10 points to citizen who submitted the complaint
+    // +10 pts to original citizen
     await User.findByIdAndUpdate(complaint.citizenId, { $inc: { points: 10 } });
     await updateBadge(complaint.citizenId);
 
@@ -207,7 +248,7 @@ export const supportComplaint = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// POST /api/complaints/:id/feedback  — citizen submits feedback
+// POST /api/complaints/:id/feedback
 // ─────────────────────────────────────────────────────────────
 export const submitFeedback = async (req, res) => {
   try {
@@ -227,11 +268,12 @@ export const submitFeedback = async (req, res) => {
     complaint.feedback = { rating, comment, resolved };
     await complaint.save();
 
-    // +25 points
+    // +25 pts
     await User.findByIdAndUpdate(req.user._id, { $inc: { points: 25 } });
     await updateBadge(req.user._id);
 
-    res.json({ success: true, complaint });
+    const obj = await withCitizenEmail(complaint);
+    res.json({ success: true, complaint: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -253,7 +295,7 @@ export const deleteComplaint = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/complaints/stats  — admin dashboard stats
+// GET /api/complaints/stats  — admin dashboard
 // ─────────────────────────────────────────────────────────────
 export const getStats = async (req, res) => {
   try {
@@ -269,30 +311,16 @@ export const getStats = async (req, res) => {
       ? (feedbacks.reduce((s, c) => s + (c.feedback?.rating || 0), 0) / feedbacks.length).toFixed(1)
       : 0;
 
-    // Category counts
-    const catAgg = await Complaint.aggregate([
-      { $group: { _id: '$category', count: { $sum: 1 } } },
-    ]);
-
-    // Ward counts
-    const wardAgg = await Complaint.aggregate([
-      { $group: { _id: '$ward', count: { $sum: 1 } } },
-    ]);
-
-    // 7-day volume
-    const sevenDays = Array.from({ length: 7 }, (_, i) => {
-      const d = new Date(); d.setDate(d.getDate() - (6 - i));
-      return d.toISOString().split('T')[0];
-    });
+    const catAgg  = await Complaint.aggregate([{ $group: { _id: '$category', count: { $sum: 1 } } }]);
+    const wardAgg = await Complaint.aggregate([{ $group: { _id: '$ward',     count: { $sum: 1 } } }]);
 
     res.json({
       success: true,
       stats: {
         total, resolvedToday, critical,
-        satisfaction: Math.round(avgRating * 20),   // convert 5-star to %
-        categories   : catAgg.map(a => ({ name: a._id, count: a.count })),
+        satisfaction : Math.round(Number(avgRating) * 20),
+        categories   : catAgg.map(a  => ({ name: a._id, count: a.count })),
         wards        : wardAgg.map(a => ({ ward: a._id, count: a.count })),
-        days         : sevenDays,
       },
     });
   } catch (err) {
@@ -303,16 +331,13 @@ export const getStats = async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
-const mapCategoryToDept = (cat) => {
-  const map = {
-    Road        : 'Roads & Infrastructure',
-    Water       : 'Water Supply',
-    Sanitation  : 'Sanitation',
-    Electricity : 'Electricity',
-    Other       : 'General Administration',
-  };
-  return map[cat] || 'General Administration';
-};
+const mapCategoryToDept = (cat) => ({
+  Road        : 'Roads & Infrastructure',
+  Water       : 'Water Supply',
+  Sanitation  : 'Sanitation',
+  Electricity : 'Electricity',
+  Other       : 'General Administration',
+}[cat] || 'General Administration');
 
 const updateBadge = async (userId) => {
   const user = await User.findById(userId);

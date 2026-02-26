@@ -7,11 +7,12 @@ import { useToast } from '@/hooks/use-toast';
 import { Star, MessageSquare } from 'lucide-react';
 
 export default function CitizenFeedback() {
-  const { currentUser, complaints, submitFeedback } = useApp();
+  const { myComplaints, submitFeedback } = useApp();
   const { toast } = useToast();
 
-  const pending = complaints.filter(c => c.citizenId === currentUser?.id && c.status === 'Resolved' && !c.feedback);
-  const completed = complaints.filter(c => c.citizenId === currentUser?.id && c.feedback);
+  // myComplaints already filtered to this citizen — no need to re-filter by citizenId
+  const pending   = myComplaints.filter(c => c.status === 'Resolved' && !c.feedback);
+  const completed = myComplaints.filter(c => c.feedback);
 
   const [ratings, setRatings] = useState<Record<string, { stars: number; resolved: string; comment: string }>>({});
 
@@ -19,22 +20,29 @@ export default function CitizenFeedback() {
   const setR = (id: string, update: Partial<typeof ratings[string]>) =>
     setRatings(prev => ({ ...prev, [id]: { ...getR(id), ...update } }));
 
-  const handleSubmit = (id: string) => {
+  const handleSubmit = async (id: string) => {
     const r = getR(id);
     if (!r.stars || !r.resolved) { toast({ title: 'Please rate and select resolution status', variant: 'destructive' }); return; }
-    submitFeedback(id, { rating: r.stars, comment: r.comment, resolved: r.resolved as any });
-    toast({ title: '✅ Feedback submitted! +25 points' });
+    try {
+      await submitFeedback(id, { rating: r.stars, comment: r.comment, resolved: r.resolved as any });
+      toast({ title: '✅ Feedback submitted! +25 points' });
+    } catch (err: any) {
+      toast({ title: '❌ ' + (err.message || 'Failed'), variant: 'destructive' });
+    }
   };
 
   const totalRatings = completed.length;
-  const avgRating = totalRatings ? (completed.reduce((sum, c) => sum + (c.feedback?.rating || 0), 0) / totalRatings).toFixed(1) : '—';
+  const avgRating = totalRatings
+    ? (completed.reduce((sum, c) => sum + (c.feedback?.rating || 0), 0) / totalRatings).toFixed(1)
+    : '—';
 
   return (
     <CitizenLayout>
       <div className="max-w-2xl mx-auto space-y-6">
-        <h1 className="text-2xl font-heading font-bold flex items-center gap-2"><MessageSquare className="h-6 w-6 text-accent" /> Feedback</h1>
+        <h1 className="text-2xl font-heading font-bold flex items-center gap-2">
+          <MessageSquare className="h-6 w-6 text-accent" /> Feedback
+        </h1>
 
-        {/* Stats */}
         <div className="card-elevated p-4 flex items-center gap-6">
           <div className="text-center">
             <p className="text-2xl font-heading font-bold">{avgRating}</p>
@@ -42,7 +50,7 @@ export default function CitizenFeedback() {
           </div>
           <div className="text-center">
             <p className="text-2xl font-heading font-bold">{totalRatings}</p>
-            <p className="text-xs text-muted-foreground">Feedbacks Given</p>
+            <p className="text-xs text-muted-foreground">Given</p>
           </div>
           <div className="text-center">
             <p className="text-2xl font-heading font-bold">{pending.length}</p>
@@ -50,7 +58,6 @@ export default function CitizenFeedback() {
           </div>
         </div>
 
-        {/* Pending */}
         {pending.length > 0 && <h2 className="font-heading font-semibold">Pending Feedback</h2>}
         {pending.map(c => {
           const r = getR(c.id);
@@ -95,7 +102,6 @@ export default function CitizenFeedback() {
           <p className="text-muted-foreground text-sm text-center py-8">No resolved complaints to provide feedback on yet.</p>
         )}
 
-        {/* Completed */}
         {completed.length > 0 && <h2 className="font-heading font-semibold">Completed Feedback</h2>}
         {completed.map(c => (
           <div key={c.id} className="card-elevated p-4 opacity-80">

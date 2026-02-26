@@ -1,44 +1,25 @@
 /**
- * AppContext.tsx  ─  src/context/AppContext.tsx
+ * AppContext.tsx — FIXED & OPTIMIZED
  *
- * ╔══════════════════════════════════════════════════════════════╗
- * ║  BUGS FIXED IN THIS VERSION                                 ║
- * ╠══════════════════════════════════════════════════════════════╣
- * ║ 1. DELETE FAILED                                             ║
- * ║    The API was called with the human-readable complaintId   ║
- * ║    (e.g. "JV-2026-001") but the backend expects MongoDB     ║
- * ║    _id. Fix: normaliseComplaint() now preserves _id AND     ║
- * ║    sets .id = complaintId. deleteComplaint() extracts the   ║
- * ║    MongoDB _id via getMongoId() and uses it for the API     ║
- * ║    call, while the UI still refers to c.id everywhere.      ║
- * ║                                                             ║
- * ║ 2. STATUS CHANGE NOT REFLECTING ON CITIZEN/ADMIN SIDE       ║
- * ║    updateComplaintStatus() now applies an OPTIMISTIC UPDATE  ║
- * ║    to React state BEFORE the API call, so the UI updates     ║
- * ║    instantly. If the API call fails the old state is        ║
- * ║    restored and an error is thrown to the caller.           ║
- * ║                                                             ║
- * ║ 3. RESOLVE FAILED                                           ║
- * ║    Same _id issue as delete. resolveComplaint() now uses    ║
- * ║    the MongoDB _id for the API call.                        ║
- * ║                                                             ║
- * ║ 4. EMAIL ON RESOLVE                                         ║
- * ║    resolveComplaint() now calls emailAPI.sendResolutionEmail ║
- * ║    after a successful resolve so the citizen gets a         ║
- * ║    confirmation email/mailto with resolution details.       ║
- * ╚══════════════════════════════════════════════════════════════╝
+ * FIXES:
+ * 1. RELOAD BUG: Cached user is restored with correct role → ProtectedRoute
+ *    now receives the right role immediately, no wrong redirects
+ * 2. FAST LOGIN: Login no longer blocks on loadComplaints; loads async after
+ * 3. DATA ISOLATION: Citizens only see their own complaints
+ * 4. LIVE UPDATES: 20s polling so admin changes appear on citizen side
+ * 5. ROLE GUARD: ProtectedRoute checks role from restored cache immediately
+ * 6. NO DOUBLE FETCH: deduplication via ref flag
  */
 
 import {
   createContext, useContext, useState,
-  useEffect, useCallback, useRef,
+  useEffect, useCallback, useRef, useMemo,
 } from 'react';
 import {
   authAPI, complaintAPI, userAPI, emailAPI,
-  getToken, setToken, removeToken,
+  getToken, setToken, removeToken, clearCache,
 } from '@/lib/api';
 
-// ─── Context type ─────────────────────────────────────────────
 interface AppContextType {
   currentUser           : any | null;
   complaints            : any[];
@@ -57,6 +38,7 @@ interface AppContextType {
   refreshComplaints     : () => Promise<void>;
   leaderboard           : any[];
   refreshLeaderboard    : (ward?: number) => Promise<void>;
+  myComplaints          : any[];
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -70,27 +52,19 @@ export const useApp = () => {
 // ─── localStorage helpers ─────────────────────────────────────
 const USER_KEY = 'jv_user';
 const saveUser = (u: any) =>
-  u ? localStorage.setItem(USER_KEY, JSON.stringify(u))
-    : localStorage.removeItem(USER_KEY);
+  u ? localStorage.setItem(USER_KEY, JSON.stringify(u)) : localStorage.removeItem(USER_KEY);
 const loadUser = (): any | null => {
-  try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); }
-  catch { return null; }
+  try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
 };
 
-// ─── normaliseComplaint ───────────────────────────────────────
-// KEY FIX: We preserve BOTH _id (for API calls) and set .id to the
-// human-readable complaintId string (for UI display and React keys).
-// Never lose _id — it's needed to build correct API URLs.
+// ─── Normalise helpers ────────────────────────────────────────
 const normaliseComplaint = (raw: any): any => {
   if (!raw) return raw;
   return {
     ...raw,
-    // Human-readable ID used in the UI (e.g. "JV-2026-00001")
-    id: raw.complaintId || raw.id || raw._id || '',
-    // MongoDB _id preserved for API calls
-    _id: raw._id || raw.id || '',
-    // complaintId always present
-    complaintId: raw.complaintId || raw.id || raw._id || '',
+    id          : raw.complaintId || raw.id || raw._id || '',
+    _id         : raw._id || raw.id || '',
+    complaintId : raw.complaintId || raw.id || raw._id || '',
   };
 };
 
@@ -99,65 +73,91 @@ const normaliseUser = (raw: any): any => {
   return { ...raw, id: raw._id || raw.id || '' };
 };
 
-// ─── matchId ─────────────────────────────────────────────────
-// Match a complaint in local state by any possible ID field.
-const matchId = (c: any, id: string): boolean =>
+const matchId = (c: any, id: string) =>
   !!(id && (c.id === id || c.complaintId === id || c._id === id));
 
-// ─── getMongoId ──────────────────────────────────────────────
-// Given the human-readable complaint ID (c.id / complaintId),
-// look it up in the complaints array and return the MongoDB _id.
-// Falls back to the passed id itself if not found (handles cases
-// where _id === complaintId, e.g. in local/seeded data).
 const getMongoId = (complaints: any[], humanId: string): string => {
   const found = complaints.find(c => matchId(c, humanId));
   if (!found) return humanId;
-  // Prefer genuine MongoDB ObjectId (_id) for API routing
   return found._id || found.complaintId || found.id || humanId;
 };
 
 // ─── Provider ─────────────────────────────────────────────────
 export const AppProvider = ({ children }: { children: React.ReactNode }) => {
-  const [currentUser, setCurrentUser] = useState<any | null>(loadUser);
+  const [currentUser, setCurrentUser] = useState<any | null>(null);
   const [complaints,  setComplaints]  = useState<any[]>([]);
   const [users,       setUsers]       = useState<any[]>([]);
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
-  const [loading,     setLoading]     = useState<boolean>(() => !!getToken());
+  // Start true so ProtectedRoute waits until auth state is resolved
+  const [loading, setLoading] = useState(true);
 
-  const didInit = useRef(false);
+  const didInit              = useRef(false);
+  const isLoadingComplaints  = useRef(false);
+  const pollTimer            = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Store current user in ref for use inside callbacks without stale closure
+  const currentUserRef       = useRef<any | null>(null);
 
-  // ── Keep cache in sync ─────────────────────────────────────
-  useEffect(() => { saveUser(currentUser); }, [currentUser]);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+    if (currentUser) saveUser(currentUser);
+  }, [currentUser]);
 
-  // ── On mount: verify token in background ──────────────────
+  // ── INIT on mount ─────────────────────────────────────────
   useEffect(() => {
     if (didInit.current) return;
     didInit.current = true;
 
     const init = async () => {
-      const token = getToken();
-      if (!token) { setLoading(false); return; }
+      const token  = getToken();
+      const cached = loadUser();
+
+      if (!token) {
+        setLoading(false);
+        return;
+      }
+
+      // KEY FIX: Restore cached user IMMEDIATELY so ProtectedRoute
+      // gets the correct role on first render — prevents wrong redirect
+      if (cached) {
+        setCurrentUser(cached);
+        currentUserRef.current = cached;
+      }
 
       try {
         const res = await authAPI.getMe();
         if (res?.user) {
           const fresh = normaliseUser(res.user);
           setCurrentUser(fresh);
-          loadComplaints().catch(() => {});
+          currentUserRef.current = fresh;
+          saveUser(fresh);
+          // Load complaints in background — don't block UI
+          loadComplaints(fresh).catch(() => {});
+          startPolling(fresh);
+        } else {
+          // getMe returned but no user — clear auth
+          removeToken(); saveUser(null);
+          setCurrentUser(null);
+          currentUserRef.current = null;
         }
       } catch (err: any) {
         const msg = String(err?.message || '').toLowerCase();
         const isRealAuthError =
-          msg.includes('401') ||
-          msg.includes('token invalid') ||
-          msg.includes('token expired') ||
-          msg.includes('not authorized') ||
+          msg.includes('401') || msg.includes('403') ||
+          msg.includes('jwt expired') || msg.includes('token invalid') ||
+          msg.includes('token expired') || msg.includes('not authorized') ||
           msg.includes('unauthorized');
 
         if (isRealAuthError) {
-          removeToken();
-          saveUser(null);
+          removeToken(); saveUser(null);
           setCurrentUser(null);
+          currentUserRef.current = null;
+        } else {
+          // Network error — keep cached session, load data from cache
+          console.warn('[JANVANI] getMe network error — keeping cached session:', msg);
+          if (cached) {
+            loadComplaints(cached).catch(() => {});
+            startPolling(cached);
+          }
         }
       } finally {
         setLoading(false);
@@ -165,25 +165,70 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     };
 
     init();
+    return () => stopPolling();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Polling for live updates (20s) ────────────────────────
+  const startPolling = useCallback((user: any) => {
+    stopPolling();
+    pollTimer.current = setInterval(() => {
+      const u = currentUserRef.current || user;
+      if (u) loadComplaints(u).catch(() => {});
+    }, 20_000);
   }, []);
 
-  // ── loadComplaints ─────────────────────────────────────────
-  const loadComplaints = useCallback(async () => {
+  const stopPolling = () => {
+    if (pollTimer.current) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+
+  // ── loadComplaints — role-aware ──────────────────────────
+  const loadComplaints = useCallback(async (user?: any) => {
+    if (isLoadingComplaints.current) return;
+    isLoadingComplaints.current = true;
     try {
-      const res = await complaintAPI.getAll({ limit: 200 });
+      const activeUser = user || currentUserRef.current;
+      if (!activeUser) return;
+
+      const params: Record<string, string | number> = { limit: 200 };
+
+      // DATA ISOLATION: citizens only fetch their own complaints
+      if (activeUser?.role === 'citizen') {
+        const uid = activeUser._id || activeUser.id;
+        if (uid) params.citizenId = uid;
+      }
+
+      const res = await complaintAPI.getAll(params);
       if (res?.complaints) {
         setComplaints(res.complaints.map(normaliseComplaint));
       }
     } catch (err) {
-      console.warn('[JANVANI] loadComplaints failed — using cached data', err);
+      console.warn('[JANVANI] loadComplaints failed:', err);
+    } finally {
+      isLoadingComplaints.current = false;
     }
   }, []);
 
   const refreshComplaints = useCallback(() => loadComplaints(), [loadComplaints]);
 
-  // ── login ──────────────────────────────────────────────────
+  // ── Derived: memoized citizen-specific complaints ────────
+  const myComplaints = useMemo(() => {
+    if (!currentUser) return [];
+    if (currentUser.role === 'admin') return complaints;
+    const uid = currentUser.id || currentUser._id;
+    return complaints.filter(c => {
+      const cid = c.citizenId?._id || c.citizenId;
+      return cid === uid || cid?.toString() === uid?.toString();
+    });
+  }, [complaints, currentUser]);
+
+  // ── login — optimized: don't block on loadComplaints ─────
   const login = async (email: string, password: string, role?: 'citizen' | 'admin'): Promise<any> => {
+    clearCache(); // Clear stale cache before login
     let result: any;
+
     if (role === 'admin') {
       result = await authAPI.adminLogin(email, password);
     } else if (role === 'citizen') {
@@ -192,35 +237,54 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
       try { result = await authAPI.citizenLogin(email, password); }
       catch { result = await authAPI.adminLogin(email, password); }
     }
-    if (!result?.token) throw new Error('Login failed');
+
+    if (!result?.token) throw new Error('Login failed — no token received');
+
     setToken(result.token);
     const user = normaliseUser(result.user);
     setCurrentUser(user);
+    currentUserRef.current = user;
     saveUser(user);
-    await loadComplaints();
+
+    // Load complaints in background — don't block navigation
+    loadComplaints(user).catch(() => {});
+    startPolling(user);
+
     return user;
   };
 
   // ── register ───────────────────────────────────────────────
   const register = async (data: any): Promise<any> => {
+    clearCache();
     const result = await (data.role === 'admin'
       ? authAPI.adminRegister(data)
       : authAPI.citizenRegister(data));
+
     if (!result?.token) throw new Error('Registration failed');
+
     setToken(result.token);
     const user = normaliseUser(result.user);
     setCurrentUser(user);
+    currentUserRef.current = user;
     saveUser(user);
-    await loadComplaints();
+
+    loadComplaints(user).catch(() => {});
+    startPolling(user);
+
     return user;
   };
 
   // ── logout ─────────────────────────────────────────────────
   const logout = () => {
+    stopPolling();
+    clearCache();
     removeToken();
     saveUser(null);
     setCurrentUser(null);
+    currentUserRef.current = null;
     setComplaints([]);
+    setUsers([]);
+    setLeaderboard([]);
   };
 
   // ── updateUser ─────────────────────────────────────────────
@@ -229,10 +293,12 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
       const res = await userAPI.updateProfile(updates);
       const updated = res?.user ? normaliseUser(res.user) : { ...currentUser, ...updates };
       setCurrentUser(updated);
+      currentUserRef.current = updated;
       saveUser(updated);
     } catch {
       const updated = { ...currentUser, ...updates };
       setCurrentUser(updated);
+      currentUserRef.current = updated;
       saveUser(updated);
     }
   };
@@ -243,56 +309,53 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     if (res?.complaint) {
       const c = normaliseComplaint(res.complaint);
       setComplaints(prev => [c, ...prev]);
-      setCurrentUser((u: any) => u ? { ...u, points: (u.points || 0) + 50 } : u);
+      setCurrentUser((u: any) => {
+        if (!u) return u;
+        const updated = {
+          ...u,
+          points: (u.points || 0) + 50,
+          complaintsSubmitted: (u.complaintsSubmitted || 0) + 1,
+        };
+        currentUserRef.current = updated;
+        saveUser(updated);
+        return updated;
+      });
       return c;
     }
     return null;
   };
 
   // ── updateComplaintStatus ──────────────────────────────────
-  // FIXED: Optimistic update so BOTH citizen and admin see the
-  // new status immediately. If the API fails, we roll back.
   const updateComplaintStatus = async (
     id: string, status: string, note?: string, officer?: string
   ) => {
-    // Snapshot for rollback
     const snapshot = complaints.slice();
-
-    // 1. Optimistic update — update state NOW before API call
     setComplaints(prev => prev.map(x =>
       matchId(x, id)
-        ? { ...x, status, ...(note    ? { adminNote: note }              : {}),
-                          ...(officer ? { assignedOfficer: officer }      : {}),
-                          updatedAt: new Date().toISOString().split('T')[0] }
+        ? { ...x, status,
+            ...(note    ? { adminNote: note }          : {}),
+            ...(officer ? { assignedOfficer: officer } : {}),
+            updatedAt: new Date().toISOString().split('T')[0] }
         : x
     ));
-
     try {
-      // 2. Get the correct MongoDB _id for the API URL
       const apiId = getMongoId(snapshot, id);
       const res = await complaintAPI.updateStatus(apiId, status, note, officer);
-
-      // 3. If backend returned the updated document, use it (authoritative)
       if (res?.complaint) {
         const c = normaliseComplaint(res.complaint);
         setComplaints(prev => prev.map(x => matchId(x, id) ? c : x));
       }
     } catch (err) {
-      // 4. Roll back optimistic update on failure
       setComplaints(snapshot);
-      throw err; // re-throw so the UI can show the error toast
+      throw err;
     }
   };
 
   // ── resolveComplaint ───────────────────────────────────────
-  // FIXED: Uses MongoDB _id for the API call, then sends email.
   const resolveComplaint = async (
     id: string, photo: string, note: string, officer: string
   ) => {
-    // Snapshot for rollback
     const snapshot = complaints.slice();
-
-    // Optimistic update
     setComplaints(prev => prev.map(x =>
       matchId(x, id)
         ? { ...x, status: 'Resolved', resolvePhoto: photo,
@@ -300,59 +363,36 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
             updatedAt: new Date().toISOString().split('T')[0] }
         : x
     ));
-
     try {
       const apiId = getMongoId(snapshot, id);
       const res = await complaintAPI.resolve(apiId, photo, note, officer);
-
-      let resolvedComplaint: any;
+      let resolved: any;
       if (res?.complaint) {
-        resolvedComplaint = normaliseComplaint(res.complaint);
-        setComplaints(prev => prev.map(x => matchId(x, id) ? resolvedComplaint : x));
+        resolved = normaliseComplaint(res.complaint);
+        setComplaints(prev => prev.map(x => matchId(x, id) ? resolved : x));
       } else {
-        // Use the optimistically updated version
-        resolvedComplaint = snapshot.find(x => matchId(x, id));
-        if (resolvedComplaint) {
-          resolvedComplaint = {
-            ...resolvedComplaint,
-            status: 'Resolved', resolvePhoto: photo,
-            adminNote: note, assignedOfficer: officer,
-            updatedAt: new Date().toISOString().split('T')[0],
-          };
-        }
+        resolved = {
+          ...(snapshot.find(x => matchId(x, id)) || {}),
+          status: 'Resolved', resolvePhoto: photo, adminNote: note, assignedOfficer: officer,
+        };
       }
-
-      // ── Send resolution email to citizen ──────────────────
-      if (resolvedComplaint) {
-        try {
-          await emailAPI.sendResolutionEmail(resolvedComplaint);
-        } catch {
-          // Email failure should not block the resolve flow
-          console.warn('[JANVANI] Resolution email failed — continuing');
-        }
+      if (resolved) {
+        try { await emailAPI.sendResolutionEmail(resolved); } catch { /* non-blocking */ }
       }
     } catch (err) {
-      // Roll back on API failure
       setComplaints(snapshot);
       throw err;
     }
   };
 
   // ── deleteComplaint ────────────────────────────────────────
-  // FIXED: Extracts MongoDB _id from the complaints array so the
-  // DELETE request hits the right backend route.
   const deleteComplaint = async (id: string) => {
-    // Snapshot for rollback
     const snapshot = complaints.slice();
-
-    // Optimistic removal from UI
     setComplaints(prev => prev.filter(x => !matchId(x, id)));
-
     try {
       const apiId = getMongoId(snapshot, id);
       await complaintAPI.delete(apiId);
     } catch (err) {
-      // Roll back if the API call failed
       setComplaints(snapshot);
       throw err;
     }
@@ -367,7 +407,6 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
         matchId(x, id) ? { ...x, supportCount: res.supportCount } : x
       ));
     } else {
-      // Optimistic increment if backend doesn't return count
       setComplaints(prev => prev.map(x =>
         matchId(x, id) ? { ...x, supportCount: (x.supportCount || 0) + 1 } : x
       ));
@@ -384,14 +423,16 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     if (res?.complaint) {
       const c = normaliseComplaint(res.complaint);
       setComplaints(prev => prev.map(x => matchId(x, id) ? c : x));
-      setCurrentUser((u: any) => u ? { ...u, points: (u.points || 0) + 25 } : u);
     } else {
-      // Optimistic update
-      setComplaints(prev => prev.map(x =>
-        matchId(x, id) ? { ...x, feedback } : x
-      ));
-      setCurrentUser((u: any) => u ? { ...u, points: (u.points || 0) + 25 } : u);
+      setComplaints(prev => prev.map(x => matchId(x, id) ? { ...x, feedback } : x));
     }
+    setCurrentUser((u: any) => {
+      if (!u) return u;
+      const updated = { ...u, points: (u.points || 0) + 25 };
+      currentUserRef.current = updated;
+      saveUser(updated);
+      return updated;
+    });
   };
 
   // ── refreshLeaderboard ─────────────────────────────────────
@@ -415,6 +456,7 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
       addComplaint, updateComplaintStatus, resolveComplaint,
       deleteComplaint, supportComplaint, submitFeedback, refreshComplaints,
       leaderboard, refreshLeaderboard,
+      myComplaints,
     }}>
       {children}
     </AppContext.Provider>
