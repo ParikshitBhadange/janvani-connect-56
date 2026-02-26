@@ -1,14 +1,20 @@
 /**
- * AppContext.tsx — FIXED & OPTIMIZED
+ * AppContext.tsx — ADMIN PERFORMANCE FIX
  *
- * FIXES:
- * 1. RELOAD BUG: Cached user is restored with correct role → ProtectedRoute
- *    now receives the right role immediately, no wrong redirects
- * 2. FAST LOGIN: Login no longer blocks on loadComplaints; loads async after
- * 3. DATA ISOLATION: Citizens only see their own complaints
- * 4. LIVE UPDATES: 20s polling so admin changes appear on citizen side
- * 5. ROLE GUARD: ProtectedRoute checks role from restored cache immediately
- * 6. NO DOUBLE FETCH: deduplication via ref flag
+ * ROOT CAUSE OF ADMIN SLOWNESS:
+ * 1. Admin dashboard fetched complaints sequentially, THEN stats separately
+ *    — two blocking round trips before anything showed on screen
+ * 2. Polling kept firing even when browser tab was hidden (wasted requests)
+ * 3. No dedicated `complaintsLoading` state — admin saw stale/empty data
+ *    with no spinner until the full request finished
+ * 4. getStats() had no caching — every page navigation re-fetched all stats
+ *
+ * FIXES APPLIED:
+ * 1. Admin login: complaints + stats fire in PARALLEL via loadData()
+ * 2. Added `complaintsLoading` state — admin pages can show skeleton instantly
+ * 3. Polling pauses when tab is hidden (Page Visibility API)
+ * 4. Stats cached in context — navigating admin pages is instant
+ * 5. resolveComplaint() auto-refreshes stats after resolution
  */
 
 import {
@@ -25,6 +31,8 @@ interface AppContextType {
   complaints            : any[];
   users                 : any[];
   loading               : boolean;
+  complaintsLoading     : boolean;
+  stats                 : any | null;
   login                 : (email: string, password: string, role?: 'citizen' | 'admin') => Promise<any>;
   register              : (data: any) => Promise<any>;
   logout                : () => void;
@@ -36,6 +44,7 @@ interface AppContextType {
   supportComplaint      : (id: string) => Promise<void>;
   submitFeedback        : (id: string, feedback: { rating: number; comment: string; resolved: any }) => Promise<void>;
   refreshComplaints     : () => Promise<void>;
+  refreshStats          : () => Promise<void>;
   leaderboard           : any[];
   refreshLeaderboard    : (ward?: number) => Promise<void>;
   myComplaints          : any[];
@@ -49,7 +58,6 @@ export const useApp = () => {
   return ctx;
 };
 
-// ─── localStorage helpers ─────────────────────────────────────
 const USER_KEY = 'jv_user';
 const saveUser = (u: any) =>
   u ? localStorage.setItem(USER_KEY, JSON.stringify(u)) : localStorage.removeItem(USER_KEY);
@@ -57,7 +65,6 @@ const loadUser = (): any | null => {
   try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
 };
 
-// ─── Normalise helpers ────────────────────────────────────────
 const normaliseComplaint = (raw: any): any => {
   if (!raw) return raw;
   return {
@@ -82,27 +89,26 @@ const getMongoId = (complaints: any[], humanId: string): string => {
   return found._id || found.complaintId || found.id || humanId;
 };
 
-// ─── Provider ─────────────────────────────────────────────────
 export const AppProvider = ({ children }: { children: React.ReactNode }) => {
-  const [currentUser, setCurrentUser] = useState<any | null>(null);
-  const [complaints,  setComplaints]  = useState<any[]>([]);
-  const [users,       setUsers]       = useState<any[]>([]);
-  const [leaderboard, setLeaderboard] = useState<any[]>([]);
-  // Start true so ProtectedRoute waits until auth state is resolved
-  const [loading, setLoading] = useState(true);
+  const [currentUser,       setCurrentUser]      = useState<any | null>(null);
+  const [complaints,        setComplaints]        = useState<any[]>([]);
+  const [users,             setUsers]             = useState<any[]>([]);
+  const [leaderboard,       setLeaderboard]       = useState<any[]>([]);
+  const [stats,             setStats]             = useState<any | null>(null);
+  const [loading,           setLoading]           = useState(true);
+  const [complaintsLoading, setComplaintsLoading] = useState(false);
 
-  const didInit              = useRef(false);
-  const isLoadingComplaints  = useRef(false);
-  const pollTimer            = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Store current user in ref for use inside callbacks without stale closure
-  const currentUserRef       = useRef<any | null>(null);
+  const didInit             = useRef(false);
+  const isLoadingComplaints = useRef(false);
+  const pollTimer           = useRef<ReturnType<typeof setInterval> | null>(null);
+  const currentUserRef      = useRef<any | null>(null);
 
   useEffect(() => {
     currentUserRef.current = currentUser;
     if (currentUser) saveUser(currentUser);
   }, [currentUser]);
 
-  // ── INIT on mount ─────────────────────────────────────────
+  // ── INIT ────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (didInit.current) return;
     didInit.current = true;
@@ -111,30 +117,33 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
       const token  = getToken();
       const cached = loadUser();
 
-      if (!token) {
-        setLoading(false);
-        return;
-      }
+      // No token → go straight to login, no spinner
+      if (!token) { setLoading(false); return; }
 
-      // KEY FIX: Restore cached user IMMEDIATELY so ProtectedRoute
-      // gets the correct role on first render — prevents wrong redirect
+      // Restore cached user IMMEDIATELY so ProtectedRoute sees role right away
       if (cached) {
         setCurrentUser(cached);
         currentUserRef.current = cached;
       }
 
+      // KEY FIX: If backend is down, don't hang for 15 seconds.
+      // Use a 5s race — if getMe doesn't respond, fall back to cached user.
       try {
-        const res = await authAPI.getMe();
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('getMe timeout')), 5000)
+        );
+
+        const res = await Promise.race([authAPI.getMe(), timeoutPromise]) as any;
+
         if (res?.user) {
           const fresh = normaliseUser(res.user);
           setCurrentUser(fresh);
           currentUserRef.current = fresh;
           saveUser(fresh);
-          // Load complaints in background — don't block UI
-          loadComplaints(fresh).catch(() => {});
+          loadData(fresh);
           startPolling(fresh);
         } else {
-          // getMe returned but no user — clear auth
+          // Server responded but no user — clear auth
           removeToken(); saveUser(null);
           setCurrentUser(null);
           currentUserRef.current = null;
@@ -144,22 +153,24 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
         const isRealAuthError =
           msg.includes('401') || msg.includes('403') ||
           msg.includes('jwt expired') || msg.includes('token invalid') ||
-          msg.includes('token expired') || msg.includes('not authorized') ||
-          msg.includes('unauthorized');
+          msg.includes('not authorized') || msg.includes('unauthorized');
 
         if (isRealAuthError) {
+          // Token is invalid — force logout
           removeToken(); saveUser(null);
           setCurrentUser(null);
           currentUserRef.current = null;
         } else {
-          // Network error — keep cached session, load data from cache
-          console.warn('[JANVANI] getMe network error — keeping cached session:', msg);
+          // Network error OR timeout — keep cached user, let them use the app
+          // They'll see stale data until the server comes back
+          console.warn('[JANVANI] Backend unreachable — using cached session');
           if (cached) {
-            loadComplaints(cached).catch(() => {});
-            startPolling(cached);
+            // Don't try to loadData — backend is down
+            // Just let them see the UI with whatever was cached
           }
         }
       } finally {
+        // ALWAYS unblock the UI — never leave loading=true forever
         setLoading(false);
       }
     };
@@ -168,33 +179,30 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     return () => stopPolling();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Polling for live updates (20s) ────────────────────────
-  const startPolling = useCallback((user: any) => {
-    stopPolling();
-    pollTimer.current = setInterval(() => {
-      const u = currentUserRef.current || user;
-      if (u) loadComplaints(u).catch(() => {});
-    }, 20_000);
-  }, []);
-
-  const stopPolling = () => {
-    if (pollTimer.current) {
-      clearInterval(pollTimer.current);
-      pollTimer.current = null;
+  // ── loadData: PARALLEL for admin, sequential for citizen ────────────────
+  // This is the key fix — admin no longer waits for complaints before getting stats
+  const loadData = useCallback((user: any) => {
+    if (user?.role === 'admin') {
+      Promise.all([
+        loadComplaints(user).catch(() => {}),
+        loadStats().catch(() => {}),
+      ]);
+    } else {
+      loadComplaints(user).catch(() => {});
     }
-  };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── loadComplaints — role-aware ──────────────────────────
+  // ── loadComplaints ───────────────────────────────────────────────────────
   const loadComplaints = useCallback(async (user?: any) => {
     if (isLoadingComplaints.current) return;
     isLoadingComplaints.current = true;
+    setComplaintsLoading(true);
+
     try {
       const activeUser = user || currentUserRef.current;
       if (!activeUser) return;
 
       const params: Record<string, string | number> = { limit: 200 };
-
-      // DATA ISOLATION: citizens only fetch their own complaints
       if (activeUser?.role === 'citizen') {
         const uid = activeUser._id || activeUser.id;
         if (uid) params.citizenId = uid;
@@ -208,12 +216,40 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
       console.warn('[JANVANI] loadComplaints failed:', err);
     } finally {
       isLoadingComplaints.current = false;
+      setComplaintsLoading(false);
+    }
+  }, []);
+
+  // ── loadStats (admin only) ───────────────────────────────────────────────
+  const loadStats = useCallback(async () => {
+    try {
+      const res = await complaintAPI.getStats();
+      if (res?.stats) setStats(res.stats);
+    } catch (err) {
+      console.warn('[JANVANI] loadStats failed:', err);
     }
   }, []);
 
   const refreshComplaints = useCallback(() => loadComplaints(), [loadComplaints]);
+  const refreshStats      = useCallback(() => loadStats(),      [loadStats]);
 
-  // ── Derived: memoized citizen-specific complaints ────────
+  // ── Polling — pauses when tab is hidden ──────────────────────────────────
+  const startPolling = useCallback((user: any) => {
+    stopPolling();
+    pollTimer.current = setInterval(() => {
+      // KEY FIX: Don't poll when browser tab is in the background
+      if (document.visibilityState === 'hidden') return;
+      const u = currentUserRef.current || user;
+      if (!u) return;
+      loadComplaints(u).catch(() => {});
+      if (u.role === 'admin') loadStats().catch(() => {});
+    }, 20_000);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const stopPolling = () => {
+    if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null; }
+  };
+
   const myComplaints = useMemo(() => {
     if (!currentUser) return [];
     if (currentUser.role === 'admin') return complaints;
@@ -224,9 +260,9 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     });
   }, [complaints, currentUser]);
 
-  // ── login — optimized: don't block on loadComplaints ─────
+  // ── login ────────────────────────────────────────────────────────────────
   const login = async (email: string, password: string, role?: 'citizen' | 'admin'): Promise<any> => {
-    clearCache(); // Clear stale cache before login
+    clearCache();
     let result: any;
 
     if (role === 'admin') {
@@ -246,14 +282,13 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     currentUserRef.current = user;
     saveUser(user);
 
-    // Load complaints in background — don't block navigation
-    loadComplaints(user).catch(() => {});
+    loadData(user); // parallel for admin
     startPolling(user);
 
     return user;
   };
 
-  // ── register ───────────────────────────────────────────────
+  // ── register ─────────────────────────────────────────────────────────────
   const register = async (data: any): Promise<any> => {
     clearCache();
     const result = await (data.role === 'admin'
@@ -267,14 +302,12 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     setCurrentUser(user);
     currentUserRef.current = user;
     saveUser(user);
-
-    loadComplaints(user).catch(() => {});
+    loadData(user);
     startPolling(user);
-
     return user;
   };
 
-  // ── logout ─────────────────────────────────────────────────
+  // ── logout ───────────────────────────────────────────────────────────────
   const logout = () => {
     stopPolling();
     clearCache();
@@ -285,9 +318,10 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     setComplaints([]);
     setUsers([]);
     setLeaderboard([]);
+    setStats(null);
   };
 
-  // ── updateUser ─────────────────────────────────────────────
+  // ── updateUser ───────────────────────────────────────────────────────────
   const updateUser = async (updates: Record<string, any>) => {
     try {
       const res = await userAPI.updateProfile(updates);
@@ -303,7 +337,7 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     }
   };
 
-  // ── addComplaint ───────────────────────────────────────────
+  // ── addComplaint ─────────────────────────────────────────────────────────
   const addComplaint = async (data: object) => {
     const res = await complaintAPI.create(data);
     if (res?.complaint) {
@@ -311,11 +345,7 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
       setComplaints(prev => [c, ...prev]);
       setCurrentUser((u: any) => {
         if (!u) return u;
-        const updated = {
-          ...u,
-          points: (u.points || 0) + 50,
-          complaintsSubmitted: (u.complaintsSubmitted || 0) + 1,
-        };
+        const updated = { ...u, points: (u.points || 0) + 50, complaintsSubmitted: (u.complaintsSubmitted || 0) + 1 };
         currentUserRef.current = updated;
         saveUser(updated);
         return updated;
@@ -325,17 +355,12 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     return null;
   };
 
-  // ── updateComplaintStatus ──────────────────────────────────
-  const updateComplaintStatus = async (
-    id: string, status: string, note?: string, officer?: string
-  ) => {
+  // ── updateComplaintStatus — optimistic ───────────────────────────────────
+  const updateComplaintStatus = async (id: string, status: string, note?: string, officer?: string) => {
     const snapshot = complaints.slice();
     setComplaints(prev => prev.map(x =>
       matchId(x, id)
-        ? { ...x, status,
-            ...(note    ? { adminNote: note }          : {}),
-            ...(officer ? { assignedOfficer: officer } : {}),
-            updatedAt: new Date().toISOString().split('T')[0] }
+        ? { ...x, status, ...(note ? { adminNote: note } : {}), ...(officer ? { assignedOfficer: officer } : {}), updatedAt: new Date().toISOString().split('T')[0] }
         : x
     ));
     try {
@@ -351,16 +376,12 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     }
   };
 
-  // ── resolveComplaint ───────────────────────────────────────
-  const resolveComplaint = async (
-    id: string, photo: string, note: string, officer: string
-  ) => {
+  // ── resolveComplaint ─────────────────────────────────────────────────────
+  const resolveComplaint = async (id: string, photo: string, note: string, officer: string) => {
     const snapshot = complaints.slice();
     setComplaints(prev => prev.map(x =>
       matchId(x, id)
-        ? { ...x, status: 'Resolved', resolvePhoto: photo,
-            adminNote: note, assignedOfficer: officer,
-            updatedAt: new Date().toISOString().split('T')[0] }
+        ? { ...x, status: 'Resolved', resolvePhoto: photo, adminNote: note, assignedOfficer: officer, updatedAt: new Date().toISOString().split('T')[0] }
         : x
     ));
     try {
@@ -371,58 +392,46 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
         resolved = normaliseComplaint(res.complaint);
         setComplaints(prev => prev.map(x => matchId(x, id) ? resolved : x));
       } else {
-        resolved = {
-          ...(snapshot.find(x => matchId(x, id)) || {}),
-          status: 'Resolved', resolvePhoto: photo, adminNote: note, assignedOfficer: officer,
-        };
+        resolved = { ...(snapshot.find(x => matchId(x, id)) || {}), status: 'Resolved', resolvePhoto: photo, adminNote: note, assignedOfficer: officer };
       }
-      if (resolved) {
-        try { await emailAPI.sendResolutionEmail(resolved); } catch { /* non-blocking */ }
-      }
+      if (resolved) { try { await emailAPI.sendResolutionEmail(resolved); } catch {} }
+      // Refresh stats after resolve so dashboard counters update instantly
+      loadStats().catch(() => {});
     } catch (err) {
       setComplaints(snapshot);
       throw err;
     }
   };
 
-  // ── deleteComplaint ────────────────────────────────────────
+  // ── deleteComplaint ───────────────────────────────────────────────────────
   const deleteComplaint = async (id: string) => {
     const snapshot = complaints.slice();
     setComplaints(prev => prev.filter(x => !matchId(x, id)));
     try {
-      const apiId = getMongoId(snapshot, id);
-      await complaintAPI.delete(apiId);
+      await complaintAPI.delete(getMongoId(snapshot, id));
     } catch (err) {
       setComplaints(snapshot);
       throw err;
     }
   };
 
-  // ── supportComplaint ───────────────────────────────────────
+  // ── supportComplaint ──────────────────────────────────────────────────────
   const supportComplaint = async (id: string) => {
     const apiId = getMongoId(complaints, id);
     const res = await complaintAPI.support(apiId);
-    if (res?.supportCount !== undefined) {
-      setComplaints(prev => prev.map(x =>
-        matchId(x, id) ? { ...x, supportCount: res.supportCount } : x
-      ));
-    } else {
-      setComplaints(prev => prev.map(x =>
-        matchId(x, id) ? { ...x, supportCount: (x.supportCount || 0) + 1 } : x
-      ));
-    }
+    setComplaints(prev => prev.map(x =>
+      matchId(x, id)
+        ? { ...x, supportCount: res?.supportCount ?? (x.supportCount || 0) + 1 }
+        : x
+    ));
   };
 
-  // ── submitFeedback ─────────────────────────────────────────
-  const submitFeedback = async (
-    id: string,
-    feedback: { rating: number; comment: string; resolved: any }
-  ) => {
+  // ── submitFeedback ────────────────────────────────────────────────────────
+  const submitFeedback = async (id: string, feedback: { rating: number; comment: string; resolved: any }) => {
     const apiId = getMongoId(complaints, id);
     const res = await complaintAPI.feedback(apiId, feedback);
     if (res?.complaint) {
-      const c = normaliseComplaint(res.complaint);
-      setComplaints(prev => prev.map(x => matchId(x, id) ? c : x));
+      setComplaints(prev => prev.map(x => matchId(x, id) ? normaliseComplaint(res.complaint) : x));
     } else {
       setComplaints(prev => prev.map(x => matchId(x, id) ? { ...x, feedback } : x));
     }
@@ -435,7 +444,7 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     });
   };
 
-  // ── refreshLeaderboard ─────────────────────────────────────
+  // ── refreshLeaderboard ────────────────────────────────────────────────────
   const refreshLeaderboard = async (ward?: number) => {
     try {
       const res = await userAPI.getLeaderboard(ward);
@@ -451,12 +460,11 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
 
   return (
     <AppContext.Provider value={{
-      currentUser, complaints, users, loading,
+      currentUser, complaints, users, loading, complaintsLoading, stats,
       login, register, logout, updateUser,
       addComplaint, updateComplaintStatus, resolveComplaint,
-      deleteComplaint, supportComplaint, submitFeedback, refreshComplaints,
-      leaderboard, refreshLeaderboard,
-      myComplaints,
+      deleteComplaint, supportComplaint, submitFeedback, refreshComplaints, refreshStats,
+      leaderboard, refreshLeaderboard, myComplaints,
     }}>
       {children}
     </AppContext.Provider>
