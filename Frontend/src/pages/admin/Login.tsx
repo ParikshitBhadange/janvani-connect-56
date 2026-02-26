@@ -6,10 +6,13 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import { Eye, EyeOff } from 'lucide-react';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 
 const DEPARTMENTS = ['Roads & Infrastructure', 'Water Supply', 'Sanitation', 'Electricity', 'Planning', 'General Administration'];
 
 export default function AdminLogin() {
+  usePageMeta(pageMeta.AdminLogin);
   const [tab, setTab] = useState<'login' | 'register'>('login');
   const [showPw, setShowPw] = useState(false);
   const { login, register } = useApp();

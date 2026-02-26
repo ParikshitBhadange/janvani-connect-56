@@ -2,6 +2,8 @@ import { useApp } from '@/context/AppContext';
 import CitizenLayout from '@/components/CitizenLayout';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 import { FileText, CheckCircle, Clock, Star, Plus, Search, AlertTriangle } from 'lucide-react';
 import { getPriorityClass, getStatusClass } from '@/types';
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
@@ -9,6 +11,7 @@ import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveCo
 const COLORS = ['hsl(217,91%,53%)', 'hsl(199,89%,48%)', 'hsl(142,72%,36%)', 'hsl(38,92%,44%)', 'hsl(0,84%,50%)'];
 
 export default function CitizenDashboard() {
+  usePageMeta(pageMeta.CitizenDashboard);
   const { currentUser, complaints } = useApp();
   const my = complaints.filter(c => c.citizenId === currentUser?.id);
   const resolved = my.filter(c => c.status === 'Resolved').length;

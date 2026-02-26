@@ -18,6 +18,8 @@
 import { useState, useRef } from 'react';
 import { useApp } from '@/context/AppContext';
 import AdminLayout from '@/components/AdminLayout';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -39,6 +41,7 @@ const DEPT_OPTIONS = [
 ];
 
 export default function AdminSettings() {
+  usePageMeta(pageMeta.AdminSettings);
   const { currentUser, complaints, updateUser } = useApp();
   const { toast } = useToast();
   const [tab, setTab] = useState('profile');

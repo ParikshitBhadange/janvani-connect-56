@@ -2,6 +2,8 @@ import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Brain, MapPin, Trophy, FileText, Search, CheckCircle, Star, ArrowRight } from 'lucide-react';
 import heroBg from '@/assets/hero-bg.jpg';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 
 const stats = [
   { value: '12,000+', label: 'Issues Resolved' },
@@ -18,6 +20,7 @@ const steps = [
 ];
 
 export default function Landing() {
+  usePageMeta(pageMeta.Landing);
   return (
     <div className="min-h-screen bg-background">
       {/* Navbar */}

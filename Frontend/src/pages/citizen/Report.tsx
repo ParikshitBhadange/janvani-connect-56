@@ -9,8 +9,12 @@ import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/hooks/use-toast';
 import { Camera, MapPin, Mic, Sparkles, CheckCircle, Loader2 } from 'lucide-react';
 import { CATEGORIES, type Category, type Priority } from '@/types';
+import { api } from '@/lib/api';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 
 export default function CitizenReport() {
+  usePageMeta(pageMeta.CitizenReport);
   const { currentUser, addComplaint } = useApp();
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -22,6 +26,7 @@ export default function CitizenReport() {
   const [locating, setLocating] = useState(false);
   const [category, setCategory] = useState<Category>('Road');
   const [analyzing, setAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState('');
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState<Priority>('Medium');
@@ -32,11 +37,23 @@ export default function CitizenReport() {
   /* -------------------- PHOTO UPLOAD -------------------- */
   const handlePhoto = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = () => setPhoto(reader.result as string);
-      reader.readAsDataURL(file);
-    }
+    if (!file) return;
+
+    // Resize image before storing to keep base64 payload manageable (~800px max)
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 800;
+      const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+      setPhoto(dataUrl);
+      URL.revokeObjectURL(objectUrl);
+    };
+    img.src = objectUrl;
   };
 
   /* -------------------- LIVE GPS LOCATION -------------------- */
@@ -53,7 +70,6 @@ export default function CitizenReport() {
         setGps({ lat, lng });
         const ward = currentUser?.ward || 1;
 
-        // Reverse geocode using Nominatim (OpenStreetMap) — free, no API key
         try {
           const res = await fetch(
             `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`,
@@ -61,21 +77,13 @@ export default function CitizenReport() {
           );
           const data = await res.json();
           const addr = data.address || {};
-          // Build a human-readable area name from available fields
           const area =
-            addr.suburb ||
-            addr.neighbourhood ||
-            addr.village ||
-            addr.town ||
-            addr.city_district ||
-            addr.county ||
-            addr.city ||
-            '';
+            addr.suburb || addr.neighbourhood || addr.village ||
+            addr.town || addr.city_district || addr.county || addr.city || '';
           const city = addr.city || addr.town || addr.county || 'Nashik';
           const areaLabel = area ? `${area}, ${city}` : city;
           setLocation(`Ward ${ward}, ${areaLabel} — ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
         } catch {
-          // Fallback if fetch fails
           setLocation(`Ward ${ward}, Nashik — ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
         }
 
@@ -112,37 +120,57 @@ export default function CitizenReport() {
 
     recognition.onresult = (event: any) => {
       const transcript = event.results[0][0].transcript;
-      setDescription((prev) => prev + ' ' + transcript);
+      setDescription((prev) => (prev ? prev + ' ' + transcript : transcript));
     };
 
     recognition.onend = () => setListening(false);
-
     recognition.onerror = () => {
       setListening(false);
       toast({ title: '❌ Voice recognition error' });
     };
   };
 
-  /* -------------------- STEP 2 AI MOCK -------------------- */
-  const goStep2 = () => {
+  /* -------------------- AI ANALYSIS -------------------- */
+  const goStep2 = async () => {
     setStep(2);
     setAnalyzing(true);
-    setTimeout(() => {
-      setAnalyzing(false);
-      const descs: Record<Category, string> = {
-        Road: 'Significant road surface damage detected in the reported area. The pothole/crack poses safety risks to vehicles and pedestrians. Immediate attention recommended.',
-        Water: 'Water supply disruption reported. Multiple households may be affected. Pipeline inspection and repair needed urgently.',
-        Sanitation: 'Waste management issue identified. Garbage accumulation posing hygiene risks. Sanitation team dispatch recommended.',
-        Electricity: 'Electrical infrastructure issue reported. Potential safety hazard. Immediate inspection by qualified electrician required.',
-        Other: 'Civic issue reported requiring municipal attention. Detailed assessment needed for appropriate departmental action.',
+    setAiError('');
+
+    try {
+      // Call backend AI endpoint
+      const result = await api.post('/ai/analyze', {
+        imageBase64: photo || null,
+        category,
+        location: location || `Ward ${currentUser?.ward || 1}, Nashik`,
+      });
+
+      setTitle(result.title || `${category} Issue — Ward ${currentUser?.ward || 1}`);
+      setDescription(result.description || '');
+      setPriority((result.priority as Priority) || 'Medium');
+      setEstimated(result.estimated || (() => {
+        const d = new Date(); d.setDate(d.getDate() + 14);
+        return d.toISOString().split('T')[0];
+      })());
+    } catch (err: any) {
+      console.error('AI analysis failed:', err);
+      setAiError('AI analysis failed. You can fill in the details manually below.');
+
+      // Fallback values
+      const fallbackDescs: Record<Category, string> = {
+        Road: 'Road surface damage has been reported in the area. The issue poses safety risks to vehicles and pedestrians. Immediate inspection and repair is recommended.',
+        Water: 'Water supply disruption has been reported. Multiple households may be affected. Pipeline inspection and repair is needed urgently.',
+        Sanitation: 'Waste management issue identified in the area. Garbage accumulation is posing hygiene and health risks. Sanitation team dispatch is recommended.',
+        Electricity: 'Electrical infrastructure issue reported. This poses a potential safety hazard to residents. Immediate inspection by a qualified electrician is required.',
+        Other: 'A civic issue has been reported requiring municipal attention. A detailed on-site assessment is needed for appropriate departmental action.',
       };
-      setDescription(descs[category]);
       setTitle(`${category} Issue — Ward ${currentUser?.ward || 1}`);
+      setDescription(fallbackDescs[category]);
       setPriority(category === 'Electricity' ? 'High' : 'Medium');
-      const d = new Date();
-      d.setDate(d.getDate() + 14);
+      const d = new Date(); d.setDate(d.getDate() + 14);
       setEstimated(d.toISOString().split('T')[0]);
-    }, 2000);
+    } finally {
+      setAnalyzing(false);
+    }
   };
 
   /* -------------------- SUBMIT -------------------- */
@@ -209,17 +237,22 @@ export default function CitizenReport() {
               >
                 {step > i + 1 ? '✓' : i + 1}
               </div>
-              <span className={`text-xs hidden sm:inline ${step === i + 1 ? 'font-semibold' : 'text-muted-foreground'}`}>{s}</span>
+              <span
+                className={`text-xs hidden sm:inline ${
+                  step === i + 1 ? 'font-semibold' : 'text-muted-foreground'
+                }`}
+              >
+                {s}
+              </span>
               {i < 2 && <div className={`flex-1 h-0.5 ${step > i + 1 ? 'bg-success' : 'bg-muted'}`} />}
             </div>
           ))}
         </div>
 
-        {/* ── STEP 1: Capture ── */}
+        {/* ---- STEP 1: Capture ---- */}
         {step === 1 && (
           <div className="space-y-5 animate-fade-in">
-
-            {/* Photo */}
+            {/* Photo upload */}
             <div>
               <Label>Photo Evidence</Label>
               <label className="mt-2 border-2 border-dashed border-border rounded-lg p-8 flex flex-col items-center cursor-pointer hover:border-accent transition-colors">
@@ -229,6 +262,9 @@ export default function CitizenReport() {
                   <>
                     <Camera className="h-10 w-10 text-muted-foreground mb-2" />
                     <span className="text-sm text-muted-foreground">Click or drag to upload</span>
+                    <span className="text-xs text-muted-foreground mt-1">
+                      Adding a photo improves AI accuracy
+                    </span>
                   </>
                 )}
                 <input type="file" accept="image/*" className="hidden" onChange={handlePhoto} />
@@ -238,7 +274,11 @@ export default function CitizenReport() {
             {/* Live Location */}
             <div className="space-y-2">
               <Button type="button" variant="outline" onClick={detectLocation} disabled={locating}>
-                {locating ? <Loader2 className="h-4 w-4 animate-spin" /> : <MapPin className="h-4 w-4" />}
+                {locating ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <MapPin className="h-4 w-4" />
+                )}
                 {locating ? 'Detecting…' : 'Detect Location'}
               </Button>
               {location && (
@@ -262,7 +302,16 @@ export default function CitizenReport() {
                         : 'border-border hover:border-accent/50'
                     }`}
                   >
-                    {c === 'Road' ? '🛣️' : c === 'Water' ? '💧' : c === 'Sanitation' ? '🗑️' : c === 'Electricity' ? '⚡' : '📋'} {c}
+                    {c === 'Road'
+                      ? '🛣️'
+                      : c === 'Water'
+                      ? '💧'
+                      : c === 'Sanitation'
+                      ? '🗑️'
+                      : c === 'Electricity'
+                      ? '⚡'
+                      : '📋'}{' '}
+                    {c}
                   </button>
                 ))}
               </div>
@@ -274,14 +323,18 @@ export default function CitizenReport() {
           </div>
         )}
 
-        {/* ── STEP 2: AI Description ── */}
+        {/* ---- STEP 2: AI Description ---- */}
         {step === 2 && (
           <div className="space-y-5 animate-fade-in">
             {analyzing ? (
               <div className="text-center py-16">
                 <div className="animate-pulse-dot inline-block h-4 w-4 rounded-full bg-accent mb-4" />
-                <p className="text-lg font-heading font-semibold">🤖 AI Analyzing...</p>
-                <p className="text-sm text-muted-foreground mt-2">Processing image and generating description</p>
+                <p className="text-lg font-heading font-semibold">🤖 AI Analyzing…</p>
+                <p className="text-sm text-muted-foreground mt-2">
+                  {photo
+                    ? 'Analyzing image and generating description with GPT-4o'
+                    : 'Generating description based on category and location'}
+                </p>
                 <div className="mt-4 space-y-2 max-w-sm mx-auto">
                   {[1, 2, 3].map((i) => (
                     <div key={i} className="h-3 bg-muted rounded animate-pulse" />
@@ -290,18 +343,25 @@ export default function CitizenReport() {
               </div>
             ) : (
               <>
-                <div className="bg-accent/5 border border-accent/20 rounded-lg p-3 flex items-center gap-2 text-sm">
-                  <Sparkles className="h-4 w-4 text-accent" />
-                  <span className="font-medium">✨ AI Generated</span>
-                  <span className="text-muted-foreground">— you can edit below</span>
-                </div>
+                {/* AI badge / error banner */}
+                {aiError ? (
+                  <div className="bg-warning/10 border border-warning/30 rounded-lg p-3 flex items-center gap-2 text-sm">
+                    <span>⚠️</span>
+                    <span className="text-warning">{aiError}</span>
+                  </div>
+                ) : (
+                  <div className="bg-accent/5 border border-accent/20 rounded-lg p-3 flex items-center gap-2 text-sm">
+                    <Sparkles className="h-4 w-4 text-accent" />
+                    <span className="font-medium">✨ AI Generated</span>
+                    <span className="text-muted-foreground">— you can edit below</span>
+                  </div>
+                )}
 
                 <div>
                   <Label>Title</Label>
                   <Input value={title} onChange={(e) => setTitle(e.target.value)} />
                 </div>
 
-                {/* Description + inline Voice Typing button */}
                 <div>
                   <Label>Description</Label>
                   <div className="flex gap-2 mt-1">
@@ -337,30 +397,42 @@ export default function CitizenReport() {
                       onChange={(e) => setPriority(e.target.value as Priority)}
                       className="w-full h-10 rounded-md border border-input bg-background px-3 text-sm"
                     >
-                      {['Low', 'Medium', 'High', 'Critical'].map((p) => <option key={p}>{p}</option>)}
+                      {['Low', 'Medium', 'High', 'Critical'].map((p) => (
+                        <option key={p}>{p}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
                     <Label>Est. Resolution</Label>
-                    <Input type="date" value={estimated} onChange={(e) => setEstimated(e.target.value)} />
+                    <Input
+                      type="date"
+                      value={estimated}
+                      onChange={(e) => setEstimated(e.target.value)}
+                    />
                   </div>
                 </div>
 
                 <div className="flex gap-3">
-                  <Button variant="outline" onClick={() => setStep(1)}>← Back</Button>
-                  <Button variant="hero" className="flex-1" onClick={() => setStep(3)}>Review →</Button>
+                  <Button variant="outline" onClick={() => setStep(1)}>
+                    ← Back
+                  </Button>
+                  <Button variant="hero" className="flex-1" onClick={() => setStep(3)}>
+                    Review →
+                  </Button>
                 </div>
               </>
             )}
           </div>
         )}
 
-        {/* ── STEP 3: Review ── */}
+        {/* ---- STEP 3: Review & Submit ---- */}
         {step === 3 && (
           <div className="space-y-5 animate-fade-in">
             <div className="card-elevated p-6 space-y-3">
               <h3 className="font-heading font-semibold text-lg">{title}</h3>
-              {photo && <img src={photo} className="rounded-lg max-h-48 object-cover w-full" alt="Issue" />}
+              {photo && (
+                <img src={photo} className="rounded-lg max-h-48 object-cover w-full" alt="Issue" />
+              )}
               <p className="text-sm text-muted-foreground">{description}</p>
               <div className="flex flex-wrap gap-2">
                 <span className="badge-pill bg-muted text-muted-foreground">{category}</span>
@@ -373,20 +445,31 @@ export default function CitizenReport() {
                 >
                   {priority}
                 </span>
-                {location && <span className="badge-pill bg-success/10 text-success">📍 {location}</span>}
+                {location && (
+                  <span className="badge-pill bg-success/10 text-success">📍 {location}</span>
+                )}
               </div>
               <p className="text-xs text-muted-foreground">Est. resolution: {estimated}</p>
             </div>
-
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" className="rounded" defaultChecked />
               <span>I confirm all details are correct</span>
             </label>
-
             <div className="flex gap-3">
-              <Button variant="outline" onClick={() => setStep(2)}>← Back</Button>
-              <Button variant="hero" className="flex-1" onClick={handleSubmit} disabled={submitting}>
-                {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
+              <Button variant="outline" onClick={() => setStep(2)}>
+                ← Back
+              </Button>
+              <Button
+                variant="hero"
+                className="flex-1"
+                onClick={handleSubmit}
+                disabled={submitting}
+              >
+                {submitting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <CheckCircle className="h-4 w-4" />
+                )}
                 {submitting ? 'Submitting...' : 'Submit Complaint'}
               </Button>
             </div>

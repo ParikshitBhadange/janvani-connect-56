@@ -7,8 +7,11 @@ import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import { Eye, EyeOff } from 'lucide-react';
 import { WARDS } from '@/types';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 
 export default function CitizenLogin() {
+  usePageMeta(pageMeta.CitizenLogin);
   const [tab, setTab] = useState<'login' | 'register' | 'forgot'>('login');
   const [showPw, setShowPw] = useState(false);
   const { login, register } = useApp();

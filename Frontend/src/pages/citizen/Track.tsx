@@ -7,8 +7,11 @@ import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
 import { Search, ThumbsUp, CheckCircle, Circle } from 'lucide-react';
 import { getPriorityClass, getStatusClass } from '@/types';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 
 export default function CitizenTrack() {
+  usePageMeta(pageMeta.CitizenTrack);
   const { complaints, supportComplaint } = useApp();
   const { toast } = useToast();
   const [params] = useSearchParams();

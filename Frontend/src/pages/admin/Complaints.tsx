@@ -19,6 +19,8 @@ import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useApp } from '@/context/AppContext';
 import AdminLayout from '@/components/AdminLayout';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
@@ -36,6 +38,7 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
 export default function AdminComplaints() {
+  usePageMeta(pageMeta.AdminComplaints);
   const { complaints, updateComplaintStatus, deleteComplaint, refreshComplaints } = useApp();
   const { toast } = useToast();
   const [searchParams, setSearchParams] = useSearchParams();

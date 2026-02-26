@@ -22,6 +22,8 @@
 import { useState } from 'react';
 import { useApp } from '@/context/AppContext';
 import AdminLayout from '@/components/AdminLayout';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -35,6 +37,7 @@ import {
 import { getPriorityClass, getStatusClass } from '@/types';
 
 export default function AdminResolve() {
+  usePageMeta(pageMeta.AdminResolve);
   const { complaints, resolveComplaint, currentUser } = useApp();
   const { toast } = useToast();
 

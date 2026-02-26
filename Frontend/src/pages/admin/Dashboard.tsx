@@ -1,6 +1,8 @@
 import { useApp } from '@/context/AppContext';
 import AdminLayout from '@/components/AdminLayout';
 import { useNavigate } from 'react-router-dom';
+import { usePageMeta } from '@/hooks/usePageMeta';
+import { pageMeta } from '@/lib/pageData';
 import { FileStack, CheckCircle, AlertTriangle, Clock, Users, Star, Brain, TrendingUp, TrendingDown } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -23,6 +25,7 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 export default function AdminDashboard() {
+  usePageMeta(pageMeta.AdminDashboard);
   const { complaints, users } = useApp();
   const navigate = useNavigate();
 
